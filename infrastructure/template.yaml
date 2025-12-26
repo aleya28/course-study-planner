@@ -1,0 +1,477 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Course Study Planner - Serverless Application
+
+Globals:
+  Function:
+    Timeout: 30
+    Runtime: nodejs20.x
+    MemorySize: 512
+    Environment:
+      Variables:
+        COURSES_TABLE: !Ref CoursesTable
+        ASSIGNMENTS_TABLE: !Ref AssignmentsTable
+        FILES_TABLE: !Ref FilesTable
+        STORAGE_BUCKET: !Ref StorageBucket
+        USER_POOL_ID: !Ref UserPool
+    Architectures:
+      - x86_64
+
+Resources:
+  # API Gateway
+  CourseApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+
+  # DynamoDB Tables
+  CoursesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: CourseStudyPlanner-Courses
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: isPublic
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: PublicCoursesIndex
+          KeySchema:
+            - AttributeName: isPublic
+              KeyType: HASH
+            - AttributeName: SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  AssignmentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: CourseStudyPlanner-Assignments
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+
+  FilesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: CourseStudyPlanner-Files
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+
+  # S3 Buckets
+  StorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'course-planner-storage-${AWS::AccountId}'
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+              - DELETE
+            AllowedOrigins:
+              - '*'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'course-planner-frontend-${AWS::AccountId}'
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+
+  # Cognito User Pool
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: CourseStudyPlannerUsers
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: false
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: CourseStudyPlannerWebApp
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          Compress: true
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  # Lambda Functions - Courses
+  CreateCourseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/functions/courses/
+      Handler: createCourse.handler
+      Events:
+        CreateCourse:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CourseApi
+            Path: /courses
+            Method: post
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CoursesTable
+
+  GetCoursesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/functions/courses/
+      Handler: getCourses.handler
+      Events:
+        GetCourses:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CourseApi
+            Path: /courses
+            Method: get
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref CoursesTable
+
+  GetCourseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/functions/courses/
+      Handler: getCourse.handler
+      Events:
+        GetCourse:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CourseApi
+            Path: /courses/{courseId}
+            Method: get
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref CoursesTable
+
+  UpdateCourseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/functions/courses/
+      Handler: updateCourse.handler
+      Events:
+        UpdateCourse:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CourseApi
+            Path: /courses/{courseId}
+            Method: put
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CoursesTable
+
+  DeleteCourseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/functions/courses/
+      Handler: deleteCourse.handler
+      Events:
+        DeleteCourse:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CourseApi
+            Path: /courses/{courseId}
+            Method: delete
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CoursesTable
+
+  # Lambda Functions - Assignments
+  CreateAssignmentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/functions/assignments/
+      Handler: createAssignment.handler
+      Events:
+        CreateAssignment:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CourseApi
+            Path: /courses/{courseId}/assignments
+            Method: post
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AssignmentsTable
+
+  GetAssignmentsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/functions/assignments/
+      Handler: getAssignments.handler
+      Events:
+        GetAssignments:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CourseApi
+            Path: /courses/{courseId}/assignments
+            Method: get
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref AssignmentsTable
+
+  UpdateAssignmentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/functions/assignments/
+      Handler: updateAssignment.handler
+      Events:
+        UpdateAssignment:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CourseApi
+            Path: /assignments/{assignmentId}
+            Method: put
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AssignmentsTable
+
+  DeleteAssignmentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/functions/assignments/
+      Handler: deleteAssignment.handler
+      Events:
+        DeleteAssignment:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CourseApi
+            Path: /assignments/{assignmentId}
+            Method: delete
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AssignmentsTable
+
+  # Lambda Functions - Files
+  UploadFileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/functions/files/
+      Handler: uploadFile.handler
+      Events:
+        UploadFile:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CourseApi
+            Path: /courses/{courseId}/files/upload
+            Method: post
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FilesTable
+        - S3CrudPolicy:
+            BucketName: !Ref StorageBucket
+
+  GetFilesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/functions/files/
+      Handler: getFiles.handler
+      Events:
+        GetFiles:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CourseApi
+            Path: /courses/{courseId}/files
+            Method: get
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref FilesTable
+
+  GetFileUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/functions/files/
+      Handler: getFileUrl.handler
+      Events:
+        GetFileUrl:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CourseApi
+            Path: /files/{fileId}
+            Method: get
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref FilesTable
+        - S3ReadPolicy:
+            BucketName: !Ref StorageBucket
+
+  # Public Catalog (No Auth Required)
+  GetPublicCatalogFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/functions/public/
+      Handler: getPublicCatalog.handler
+      Events:
+        GetPublicCatalog:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CourseApi
+            Path: /public/catalog
+            Method: get
+            Auth:
+              Authorizer: NONE
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref CoursesTable
+
+  # Gateway Responses for CORS handling
+  ApiGatewayResponseDefault4XX:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref CourseApi
+      ResponseType: DEFAULT_4XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+
+  ApiGatewayResponseDefault5XX:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref CourseApi
+      ResponseType: DEFAULT_5XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${CourseApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+  
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+  
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+  
+  CloudFrontUrl:
+    Description: CloudFront Distribution URL
+    Value: !GetAtt CloudFrontDistribution.DomainName
+  
+  FrontendBucket:
+    Description: S3 Frontend Bucket Name
+    Value: !Ref FrontendBucket
+  
+  StorageBucket:
+    Description: S3 Storage Bucket Name
+    Value: !Ref StorageBucket
